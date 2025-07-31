@@ -203,7 +203,7 @@ type SendMessageRequest struct {
 }
 
 // Function to send a WhatsApp message
-func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message string, mediaPath string) (bool, string) {
+func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, recipient string, message string, mediaPath string) (bool, string) {
 	if !client.IsConnected() {
 		return false, "Not connected to WhatsApp"
 	}
@@ -362,10 +362,63 @@ func sendWhatsAppMessage(client *whatsmeow.Client, recipient string, message str
 	}
 
 	// Send message
-	_, err = client.SendMessage(context.Background(), recipientJID, msg)
+	resp, err := client.SendMessage(context.Background(), recipientJID, msg)
 
 	if err != nil {
 		return false, fmt.Sprintf("Error sending message: %v", err)
+	}
+
+	// Store the sent message in our database
+	if messageStore != nil {
+		chatJID := recipientJID.String()
+		senderJID := client.Store.ID.User // Our own user ID
+
+		// Determine message content and media info
+		var content string
+		var mediaType, filename, url string
+		var mediaKey, fileSHA256, fileEncSHA256 []byte
+		var fileLength uint64
+
+		if message != "" {
+			content = message
+		}
+
+		if mediaPath != "" {
+			// Extract media info from the sent message
+			mediaType, filename, url, mediaKey, fileSHA256, fileEncSHA256, fileLength = extractMediaInfo(msg)
+			// If filename is empty, use the original file path
+			if filename == "" {
+				filename = filepath.Base(mediaPath)
+			}
+		}
+
+		// Store the message with current timestamp
+		err = messageStore.StoreMessage(
+			resp.ID, // Use the message ID from the response
+			chatJID,
+			senderJID,
+			content,
+			resp.Timestamp, // Use timestamp from response
+			true,           // isFromMe = true for sent messages
+			mediaType,
+			filename,
+			url,
+			mediaKey,
+			fileSHA256,
+			fileEncSHA256,
+			fileLength,
+		)
+
+		if err != nil {
+			fmt.Printf("Warning: Failed to store sent message in database: %v\n", err)
+		}
+
+		// Also update/create the chat entry
+		chatName := recipientJID.User // Use recipient's number as fallback name
+		err = messageStore.StoreChat(chatJID, chatName, resp.Timestamp)
+		if err != nil {
+			fmt.Printf("Warning: Failed to store chat info: %v\n", err)
+		}
 	}
 
 	return true, fmt.Sprintf("Message sent to %s", recipient)
@@ -641,7 +694,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	}
 
 	// Download the media using whatsmeow client
-	mediaData, err := client.Download(downloader)
+	mediaData, err := client.Download(context.Background(), downloader)
 	if err != nil {
 		return false, "", "", "", fmt.Errorf("failed to download media: %v", err)
 	}
@@ -706,7 +759,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		fmt.Println("Received request to send message", req.Message, req.MediaPath)
 
 		// Send the message
-		success, message := sendWhatsAppMessage(client, req.Recipient, req.Message, req.MediaPath)
+		success, message := sendWhatsAppMessage(client, messageStore, req.Recipient, req.Message, req.MediaPath)
 		fmt.Println("Message sent", success, message)
 		// Set response headers
 		w.Header().Set("Content-Type", "application/json")
@@ -800,14 +853,14 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New("sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
 	}
 
 	// Get device store - This contains session information
-	deviceStore, err := container.GetFirstDevice()
+	deviceStore, err := container.GetFirstDevice(context.Background())
 	if err != nil {
 		if err == sql.ErrNoRows {
 			// No device exists, create one
@@ -988,7 +1041,7 @@ func GetChatName(client *whatsmeow.Client, messageStore *MessageStore, jid types
 		logger.Infof("Getting name for contact: %s", chatJID)
 
 		// Just use contact info (full name)
-		contact, err := client.Store.Contacts.GetContact(jid)
+		contact, err := client.Store.Contacts.GetContact(context.Background(), jid)
 		if err == nil && contact.FullName != "" {
 			name = contact.FullName
 		} else if sender != "" {

@@ -29,6 +29,7 @@ class Chat:
     last_message: Optional[str] = None
     last_sender: Optional[str] = None
     last_is_from_me: Optional[bool] = None
+    message_timestamp: Optional[datetime] = None
 
     @property
     def is_group(self) -> bool:
@@ -451,11 +452,12 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
                 c.last_message_time,
                 m.content as last_message,
                 m.sender as last_sender,
-                m.is_from_me as last_is_from_me
+                m.is_from_me as last_is_from_me,
+                m.timestamp as message_time
             FROM chats c
             JOIN messages m ON c.jid = m.chat_jid
             WHERE m.sender = ? OR c.jid = ?
-            ORDER BY c.last_message_time DESC
+            ORDER BY m.timestamp DESC
             LIMIT ? OFFSET ?
         """, (jid, jid, limit, page * limit))
         
@@ -469,7 +471,8 @@ def get_contact_chats(jid: str, limit: int = 20, page: int = 0) -> List[Chat]:
                 last_message_time=datetime.fromisoformat(chat_data[2]) if chat_data[2] else None,
                 last_message=chat_data[3],
                 last_sender=chat_data[4],
-                last_is_from_me=chat_data[5]
+                last_is_from_me=chat_data[5],
+                message_timestamp=datetime.fromisoformat(chat_data[6]) if chat_data[6] else None
             )
             result.append(chat)
             
