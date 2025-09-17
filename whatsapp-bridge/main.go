@@ -520,6 +520,44 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 		} else if content != "" {
 			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
 		}
+
+		// Trigger webhook for incoming messages only
+		if direction == "←" && content != "" {
+			go func() {
+				// Extract phone number from sender (remove @s.whatsapp.net suffix)
+				phoneNumber := strings.Split(sender, "@")[0]
+				
+				// Create JSON payload as a single object
+				payload := map[string]string{
+					"target_phone_number": phoneNumber,
+					"trigger_type":        "individual_thread",
+					"analysis_mode":       "individual",
+				}
+				
+				// Convert to JSON
+				jsonData, err := json.Marshal(payload)
+				if err != nil {
+					logger.Warnf("Failed to marshal webhook payload: %v", err)
+					return
+				}
+				
+				// Make POST request to webhook
+				resp, err := http.Post("http://localhost:5678/webhook/xfused-individual-thread", 
+					"application/json", 
+					bytes.NewBuffer(jsonData))
+				if err != nil {
+					logger.Warnf("Failed to call webhook: %v", err)
+					return
+				}
+				defer resp.Body.Close()
+				
+				if resp.StatusCode == 200 {
+					logger.Infof("Webhook called successfully for message from %s", phoneNumber)
+				} else {
+					logger.Warnf("Webhook returned status %d for message from %s", resp.StatusCode, phoneNumber)
+				}
+			}()
+		}
 	}
 }
 
