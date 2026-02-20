@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -49,12 +50,12 @@ type MessageStore struct {
 // Initialize message store
 func NewMessageStore() (*MessageStore, error) {
 	// Create directory for database if it doesn't exist
-	if err := os.MkdirAll("store", 0755); err != nil {
+	if err := os.MkdirAll("../../store", 0755); err != nil {
 		return nil, fmt.Errorf("failed to create store directory: %v", err)
 	}
 
 	// Open SQLite database for messages
-	db, err := sql.Open("sqlite3", "file:store/messages.db?_foreign_keys=on")
+	db, err := sql.Open("sqlite3", "file:../../store/messages.db?_foreign_keys=on")
 	if err != nil {
 		return nil, fmt.Errorf("failed to open message database: %v", err)
 	}
@@ -216,10 +217,37 @@ func sendWhatsAppMessage(client *whatsmeow.Client, messageStore *MessageStore, r
 	isJID := strings.Contains(recipient, "@")
 
 	if isJID {
-		// Parse the JID string
-		recipientJID, err = types.ParseJID(recipient)
-		if err != nil {
-			return false, fmt.Sprintf("Error parsing JID: %v", err)
+		// Handle @lid (Linked ID) format - need to look up the actual phone number
+		// LID is a privacy-focused identifier that cannot be used for sending messages directly
+		// The LID number is NOT a phone number - we must look up the real PN from the store
+		if strings.HasSuffix(recipient, "@lid") {
+			// Parse the LID JID first
+			lidJID, parseErr := types.ParseJID(recipient)
+			if parseErr != nil {
+				return false, fmt.Sprintf("Error parsing LID JID: %v", parseErr)
+			}
+
+			// Look up the actual phone number from the LID mapping
+			pnJID, lookupErr := client.Store.LIDs.GetPNForLID(context.Background(), lidJID)
+			if lookupErr != nil {
+				// Fallback: try using the LID user part as phone number (might work in some cases)
+				fmt.Printf("[WARN] Could not resolve LID to PN: %v. Trying fallback with user part.\n", lookupErr)
+				user := strings.TrimSuffix(recipient, "@lid")
+				recipientJID = types.JID{
+					User:   user,
+					Server: "s.whatsapp.net",
+				}
+				fmt.Printf("[DEBUG] Fallback: Using user part as phone: %s -> %s\n", recipient, recipientJID.String())
+			} else {
+				recipientJID = pnJID
+				fmt.Printf("[DEBUG] Resolved LID to PN: %s -> %s\n", recipient, recipientJID.String())
+			}
+		} else {
+			// Parse the JID string
+			recipientJID, err = types.ParseJID(recipient)
+			if err != nil {
+				return false, fmt.Sprintf("Error parsing JID: %v", err)
+			}
 		}
 	} else {
 		// Create JID from phone number
@@ -521,44 +549,90 @@ func handleMessage(client *whatsmeow.Client, messageStore *MessageStore, msg *ev
 			fmt.Printf("[%s] %s %s: %s\n", timestamp, direction, sender, content)
 		}
 
-		// Trigger webhook for incoming messages only
-		if direction == "←" && content != "" {
-			go func() {
-				// Extract phone number from sender (remove @s.whatsapp.net suffix)
-				phoneNumber := strings.Split(sender, "@")[0]
+		// // Trigger webhook for incoming messages only
+		// if direction == "←" && content != "" {
+		// 	go func() {
+		// 		// Extract phone number from sender (remove @s.whatsapp.net suffix)
+		// 		phoneNumber := strings.Split(sender, "@")[0]
 				
-				// Create JSON payload as a single object
-				payload := map[string]string{
-					"target_phone_number": phoneNumber,
-					"trigger_type":        "individual_thread",
-					"analysis_mode":       "individual",
-				}
+		// 		// Create JSON payload as a single object
+		// 		payload := map[string]string{
+		// 			"target_phone_number": phoneNumber,
+		// 			"trigger_type":        "individual_thread",
+		// 			"analysis_mode":       "individual",
+		// 		}
 				
-				// Convert to JSON
-				jsonData, err := json.Marshal(payload)
-				if err != nil {
-					logger.Warnf("Failed to marshal webhook payload: %v", err)
-					return
-				}
+		// 		// Convert to JSON
+		// 		jsonData, err := json.Marshal(payload)
+		// 		if err != nil {
+		// 			logger.Warnf("Failed to marshal webhook payload: %v", err)
+		// 			return
+		// 		}
 				
-				// Make POST request to webhook
-				resp, err := http.Post("http://localhost:5678/webhook/xfused-individual-thread", 
-					"application/json", 
-					bytes.NewBuffer(jsonData))
-				if err != nil {
-					logger.Warnf("Failed to call webhook: %v", err)
-					return
-				}
-				defer resp.Body.Close()
+		// 		// Make POST request to webhook
+		// 		resp, err := http.Post("http://localhost:5678/webhook/xfused-individual-thread", 
+		// 			"application/json", 
+		// 			bytes.NewBuffer(jsonData))
+		// 		if err != nil {
+		// 			logger.Warnf("Failed to call webhook: %v", err)
+		// 			return
+		// 		}
+		// 		defer resp.Body.Close()
 				
-				if resp.StatusCode == 200 {
-					logger.Infof("Webhook called successfully for message from %s", phoneNumber)
-				} else {
-					logger.Warnf("Webhook returned status %d for message from %s", resp.StatusCode, phoneNumber)
-				}
-			}()
+		// 		if resp.StatusCode == 200 {
+		// 			logger.Infof("Webhook called successfully for message from %s", phoneNumber)
+		// 		} else {
+		// 			logger.Warnf("Webhook returned status %d for message from %s", resp.StatusCode, phoneNumber)
+		// 		}
+		// 	}()
+		// }
+		// Resolve phone number from sender JID (handle LID format)
+		phoneNumber := sender
+		senderJIDStr := msg.Info.Sender.String()
+		if strings.HasSuffix(senderJIDStr, "@lid") {
+			// Try to resolve LID to actual phone number
+			pnJID, lookupErr := client.Store.LIDs.GetPNForLID(context.Background(), msg.Info.Sender)
+			if lookupErr != nil {
+				logger.Warnf("Could not resolve LID to PN for sender %s: %v", senderJIDStr, lookupErr)
+				// Fallback: use the sender user part
+				phoneNumber = sender
+			} else {
+				phoneNumber = pnJID.User
+			}
 		}
-	}
+
+		// Send message details as POST to localhost:8081
+		messageData := map[string]interface{}{
+			"id":           msg.Info.ID,
+			"chat_jid":     chatJID,
+			"chat_name":    name,
+			"sender":       sender,
+			"phone_number": phoneNumber,
+			"content":      content,
+			"timestamp":    msg.Info.Timestamp.Format(time.RFC3339),
+			"is_from_me":   msg.Info.IsFromMe,
+			"media_type":   mediaType,
+			"filename":     filename,
+			"url":          url,
+			"file_length":  fileLength,
+		}
+
+		jsonData, jsonErr := json.Marshal(messageData)
+		if jsonErr != nil {
+			logger.Warnf("Failed to marshal message data for POST: %v", jsonErr)
+		} else {
+			// Connect to Python agent via Unix domain socket
+			conn, dialErr := net.Dial("unix", "/tmp/whatsapp-leo.sock")
+			if dialErr != nil {
+				logger.Warnf("Failed to connect to agent socket: %v", dialErr)
+			} else {
+				_, writeErr := conn.Write(jsonData)
+				if writeErr != nil {
+					logger.Warnf("Failed to write to agent socket: %v", writeErr)
+				}
+				conn.Close()
+			}
+		}
 }
 
 // DownloadMediaRequest represents the request body for the download media API
@@ -653,7 +727,7 @@ func downloadMedia(client *whatsmeow.Client, messageStore *MessageStore, message
 	var err error
 
 	// First, check if we already have this file
-	chatDir := fmt.Sprintf("store/%s", strings.ReplaceAll(chatJID, ":", "_"))
+	chatDir := fmt.Sprintf("../../store/%s", strings.ReplaceAll(chatJID, ":", "_"))
 	localPath := ""
 
 	// Get media info from the database
@@ -766,10 +840,16 @@ func extractDirectPathFromURL(url string) string {
 	return "/" + pathPart
 }
 
-// Start a REST API server to expose the WhatsApp client functionality
+// Unix socket path for REST API
+const BridgeSocketPath = "/tmp/whatsapp-bridge.sock"
+
+// Start a REST API server to expose the WhatsApp client functionality via Unix socket
 func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port int) {
+	// Create a new ServeMux for routing
+	mux := http.NewServeMux()
+
 	// Handler for sending messages
-	http.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/send", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -815,7 +895,7 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 	})
 
 	// Handler for downloading media
-	http.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/download", func(w http.ResponseWriter, r *http.Request) {
 		// Only allow POST requests
 		if r.Method != http.MethodPost {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -865,13 +945,29 @@ func startRESTServer(client *whatsmeow.Client, messageStore *MessageStore, port 
 		})
 	})
 
-	// Start the server
-	serverAddr := fmt.Sprintf(":%d", port)
-	fmt.Printf("Starting REST API server on %s...\n", serverAddr)
+	// Remove existing socket file if it exists
+	if err := os.Remove(BridgeSocketPath); err != nil && !os.IsNotExist(err) {
+		fmt.Printf("Warning: Failed to remove existing socket file: %v\n", err)
+	}
+
+	// Create Unix domain socket listener
+	listener, err := net.Listen("unix", BridgeSocketPath)
+	if err != nil {
+		fmt.Printf("Failed to create Unix socket: %v\n", err)
+		return
+	}
+
+	// Set socket permissions so other processes can connect
+	if err := os.Chmod(BridgeSocketPath, 0666); err != nil {
+		fmt.Printf("Warning: Failed to set socket permissions: %v\n", err)
+	}
+
+	fmt.Printf("Starting REST API server on Unix socket %s...\n", BridgeSocketPath)
 
 	// Run server in a goroutine so it doesn't block
 	go func() {
-		if err := http.ListenAndServe(serverAddr, nil); err != nil {
+		server := &http.Server{Handler: mux}
+		if err := server.Serve(listener); err != nil {
 			fmt.Printf("REST API server error: %v\n", err)
 		}
 	}()
@@ -891,7 +987,7 @@ func main() {
 		return
 	}
 
-	container, err := sqlstore.New(context.Background(), "sqlite3", "file:store/whatsapp.db?_foreign_keys=on", dbLog)
+	container, err := sqlstore.New(context.Background(), "sqlite3", "file:../../store/whatsapp.db?_foreign_keys=on", dbLog)
 	if err != nil {
 		logger.Errorf("Failed to connect to database: %v", err)
 		return
